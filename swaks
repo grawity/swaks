@@ -714,6 +714,12 @@ sub do_smtp_auth {
 				$auth_attempted = 1;
 			}
 		}
+		foreach my $type (@{$G::auth_map_t{'GSSAPI'}}) {
+			if ($btype eq $type) {
+				return(0) if (do_smtp_auth_gssapi($au, $ap, $type));
+				$auth_attempted = 1;
+			}
+		}
 		foreach my $type (@{$G::auth_map_t{'NTLM'}}) {
 			if ($btype eq $type) {
 				return(0) if (do_smtp_auth_ntlm($au, $ap, $type));
@@ -735,6 +741,151 @@ sub do_smtp_auth {
 	}
 
 	return $auth_attempted ? 4 : 2;
+}
+
+sub do_smtp_auth_gssapi {
+	my $u  = shift; # auth user
+	my $p  = shift; # auth password
+	my $as = shift; # auth string
+
+	my $ro = '';    # will store smtp output
+	my $ri = '';    # will store smtp input
+	my $status;     # will store a GSSAPI::Status
+
+	my @gss_name;
+	my $authz_id = '';
+
+	if (exists($G::auth_extras{"GSS-SERV-TYPE"})) {
+		$gss_name[0] = $G::auth_extras{"GSS-SERV-TYPE"};
+	} else {
+		$gss_name[0] = 'smtp';
+	}
+
+	if (exists($G::auth_extras{"GSS-HOST"})) {
+		$gss_name[1] = $G::auth_extras{"GSS-HOST"};
+	} else {
+		if ($G::link{type} eq 'socket-inet') {
+			$gss_name[1] = $G::link{server};
+		} else {
+			# our local FQDN is the most sensible choice here, unlike in DIGEST-MD5
+			$gss_name[1] = get_fqdn(hostname());
+		}
+	}
+
+	my $gss_name;
+	$status = GSSAPI::Name->import($gss_name,
+	                               join('@', @gss_name),
+	                               &GSSAPI::OID::gss_nt_hostbased_service);
+	if (!$status) {
+		ptrans('12', "GSSAPI: Error received while importing service name: $status");
+		return(0);
+	}
+
+	# RFC 4752 (SASL GSSAPI) specifically defines Kerberos 5 and not any
+	# other GSS-API mech. The mechanism always produces an initial client
+	# response.
+
+	my $is_first = 1;
+	my $in_token = '';
+	my $out_token;
+
+	my $gss_ctx = GSSAPI::Context->new();
+	do {
+		$status = $gss_ctx->init(&GSSAPI::GSS_C_NO_CREDENTIAL,
+		                         $gss_name,
+		                         &GSSAPI::OID::gss_mech_krb5,
+		                         &GSSAPI::GSS_C_INTEG_FLAG | &GSSAPI::GSS_C_MUTUAL_FLAG,
+		                         0,
+		                         &GSSAPI::GSS_C_NO_CHANNEL_BINDINGS,
+		                         $in_token,
+		                         undef,
+		                         $out_token,
+		                         undef,
+		                         undef);
+		if (GSSAPI::Status::GSS_ERROR($status->major)) {
+			ptrans('12', "Error received from GSSAPI (init): $status");
+			return(0);
+		}
+
+		if ($is_first) {
+			# RFC 4954 (SMTP SASL) allows the initial response to optionally be
+			# part of AUTH if it fits in a SMTP line (i.e. maximum 738 byte raw
+			# response). If IR not sent, the server must produce an empty "334 ".
+			$is_first = 0;
+			$ro = "AUTH $as ".eb64($out_token);
+			if (length($ro) > 998) {
+				# Too long for IR; use the normal method.
+				$ro = "AUTH $as";
+				do_smtp_gen($ro, '334', \$ri, '',
+				                 $G::auth_showpt ? $out_token : '',
+				                 $G::auth_showpt ? \&unencode_smtp : '')
+					|| return(0);
+				# Expect empty challenge, because we know SASL GSSAPI is a client-first mechanism.
+				$ri =~ s/^....//;
+				if (length($ri) > 0) {
+					ptrans('12', "Cancelling SASL exchange, unexpected data from server");
+					return(0);
+				}
+				$ro = eb64($out_token);
+			}
+		} else {
+			$ro = eb64($out_token);
+		}
+
+		do_smtp_gen($ro, qr/(334|235)/, \$ri, '',
+		                 $G::auth_showpt ? $out_token : '',
+		                 $G::auth_showpt ? \&unencode_smtp : '')
+			|| return(0);
+		if ($ri =~ /^334 /) {
+			$ri =~ s/^....//;
+			$in_token = db64($ri);
+		} else {
+			return(0);
+		}
+	} until ($status->major == &GSSAPI::GSS_S_COMPLETE);
+
+	# The main GSS-API exchange is complete, now exchange the final
+	# SASL-specific token (which indicates the security layers and
+	# authorization identity).
+	my $buf;
+	$status = $gss_ctx->unwrap($in_token, $buf, undef, undef);
+	if (!$status) {
+		ptrans('12', "Error received from GSSAPI (unwrap): $status");
+		return(0);
+	}
+	if (length($buf) != 4) {
+		ptrans('12', "GSSAPI: Invalid token length");
+		return(0);
+	}
+
+	# SMTP, like most other protocols, does not use SASL data security layers.
+	# So we don't care about the buffer size and only accept the null layer.
+	($buf) = unpack('C', substr($buf, 0, 1));
+	if (!($buf & 1)) {
+		ptrans('12', "SASL: Server does not support null SASL security layer");
+		return(0);
+	}
+
+	# Offer the null layer and unlimited buffer size.
+	$buf = pack('CCCC', 1, 0xFF, 0xFF, 0xFF);
+	$buf .= $authz_id;
+	$status = $gss_ctx->wrap(0, 0, $buf, undef, $out_token);
+	if (!$status) {
+		ptrans('12', "Error received from GSSAPI (wrap): $status");
+		return(0);
+	}
+
+	# Send the final token.
+	$ro = eb64($out_token);
+	do_smtp_gen($ro, qr/(334|235)/, \$ri, '',
+		         $G::auth_showpt ? $out_token : '',
+		         $G::auth_showpt ? \&unencode_smtp : '')
+		|| return(0);
+	if ($ri =~ /^235 /) {
+		return(1);
+	} else {
+		return(0);
+	}
 }
 
 sub do_smtp_auth_ntlm {
@@ -1636,6 +1787,7 @@ sub load_dependencies {
 		                                                         req => []                    },
 		auth_cram_md5   => { name => "AUTH CRAM-MD5",            req => ['Digest::MD5']       },
 		auth_cram_sha1  => { name => "AUTH CRAM-SHA1",           req => ['Digest::SHA']       },
+		auth_gssapi     => { name => "AUTH GSSAPI",              req => ['GSSAPI']            },
 		auth_ntlm       => { name => "AUTH NTLM",                req => ['Authen::NTLM']      },
 		auth_digest_md5 => { name => "AUTH DIGEST-MD5",          req => ['Authen::SASL']      },
 		dns             => { name => "MX Routing",               req => ['Net::DNS']          },
@@ -3362,7 +3514,7 @@ sub process_args {
 
 		# handle the --auth-map options plus our default mappings
 		foreach (split(/\s*,\s*/, get_arg('auth_map', $o)),"PLAIN=PLAIN","LOGIN=LOGIN",
-		                          "CRAM-MD5=CRAM-MD5","DIGEST-MD5=DIGEST-MD5",
+		                          "CRAM-MD5=CRAM-MD5","DIGEST-MD5=DIGEST-MD5","GSSAPI=GSSAPI",
 		                          "CRAM-SHA1=CRAM-SHA1","NTLM=NTLM","SPA=NTLM","MSN=NTLM")
 		{
 			if (/^([^=]+)=(.+)$/) {
@@ -3419,6 +3571,8 @@ sub process_args {
 					ptrans(12, avail_str("auth_cram_md5"))   if ($auth_t ne 'ANY');
 				} elsif ($G::auth_map_f{$type} eq 'CRAM-SHA1'  && !avail("auth_cram_sha1")) {
 					ptrans(12, avail_str("auth_cram_sha1"))  if ($auth_t ne 'ANY');
+				} elsif ($G::auth_map_f{$type} eq 'GSSAPI'     && !avail("auth_gssapi")) {
+					ptrans(12, avail_str("auth_gssapi"))     if ($auth_t ne 'ANY');
 				} elsif ($G::auth_map_f{$type} eq 'NTLM'       && !avail("auth_ntlm")) {
 					ptrans(12, avail_str("auth_ntlm"))       if ($auth_t ne 'ANY');
 				} elsif ($G::auth_map_f{$type} eq 'DIGEST-MD5' && !avail("auth_digest_md5")) {
@@ -3770,6 +3924,14 @@ sub get_date_string {
 			                      POSIX::strftime("%Y %H:%M:%S %z", @l));
 	}
 	return($G::date_string);
+}
+
+sub get_fqdn {
+	my $h = shift;
+
+	my @r = gethostbyname($h);
+
+	return $r[0] // $h;
 }
 
 # partially Cribbed from "Programming Perl" and MIME::Base64 v2.12
